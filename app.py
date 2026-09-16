@@ -15,7 +15,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-st.title("📊 Contribution Matchback of BOSE-US")
+st.title("📊 Contribution Matchback")
 
 # =========================
 # CUSTOM CSS: JUGGLING BOSE LOADER
