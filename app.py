@@ -137,38 +137,6 @@ def load_main_spec(file_like_object):
         return None
 
 @st.cache_data
-def load_pmf(file_like_object):
-    try:
-        xl = pd.ExcelFile(file_like_object)
-        sheet_name = next((s for s in xl.sheet_names if "pmf" in s.lower()), None)
-        if not sheet_name:
-            st.error(f"❌ No sheet named like 'PMF' found. Sheets: {xl.sheet_names}")
-            return None
-        
-        df = pd.read_excel(file_like_object, sheet_name=sheet_name, dtype=str)
-        df.columns = [str(c).strip().upper() for c in df.columns]
-
-        geo_col = next((c for c in df.columns if "GEO" in c), None)
-        if not geo_col:
-            st.error("❌ Geography column not found in PMF.")
-            return None
-        df.rename(columns={geo_col: "GEOGRAPHY"}, inplace=True)
-
-        possible_season = ["SEASON", "PERIOD MAPPING", "PERIOD_MAPPING", "PERIOD_DEFINITION", "TIME_PERIODS"]
-        season_col = next((c for c in df.columns if c in possible_season), None)
-        if not season_col:
-            st.error("❌ Season column not found in PMF.")
-            return None
-        df.rename(columns={season_col: "SEASON"}, inplace=True)
-
-        df["GEOGRAPHY"] = df["GEOGRAPHY"].astype(str).str.upper().str.strip()
-        df["SEASON"] = df["SEASON"].astype(str).str.upper().str.strip()
-        return df
-    except Exception as e:
-        st.error(f"Error loading PMF: {e}")
-        return None
-
-@st.cache_data
 def load_granular(file_like_object):
     try:
         xl = pd.ExcelFile(file_like_object)
@@ -189,16 +157,50 @@ def load_granular(file_like_object):
 # =========================
 # PROCESSING HELPERS
 # =========================
-def prepare_pmf_multipliers(pmf_df):
-    pmf_vars = [c for c in pmf_df.columns if "_PMF" in c]
-    pmf_long = pmf_df.melt(id_vars=["GEOGRAPHY", "SEASON"], value_vars=pmf_vars,
-                          var_name="VARIABLE_PMF", value_name="MULTIPLIER")
 
-    pmf_long["VARIABLE"] = pmf_long["VARIABLE_PMF"].str.replace("_PMF", "", regex=False)
-    pmf_long["MULTIPLIER"] = pd.to_numeric(pmf_long["MULTIPLIER"], errors="coerce")
-
-    pmf_dict = {(r.GEOGRAPHY, r.SEASON, r.VARIABLE): r.MULTIPLIER for r in pmf_long.itertuples()}
-    return pmf_dict
+def generate_dynamic_pmf(last_df, curr_df, model_key, var_col, geo_col):
+    """Calculates PMF multipliers by dividing Last Weekly by Current Weekly."""
+    # 1. Filter by selected ModelKey
+    last_sub = last_df[last_df['ModelKey'] == model_key].copy()
+    curr_sub = curr_df[curr_df['ModelKey'] == model_key].copy()
+    
+    # 2. Identify Season columns (excluding metadata)
+    meta_cols = ['ModelKey', var_col, geo_col]
+    period_cols = [c for c in last_sub.columns if c not in meta_cols and not str(c).startswith("Unnamed:")]
+    
+    # 3. Melt dataframes to long format
+    last_long = last_sub.melt(id_vars=[geo_col, var_col], value_vars=period_cols, 
+                              var_name="SEASON", value_name="LAST_VAL")
+    curr_long = curr_sub.melt(id_vars=[geo_col, var_col], value_vars=period_cols, 
+                              var_name="SEASON", value_name="CURR_VAL")
+    
+    # 4. Merge on Geography, Variable, and Season
+    merged = pd.merge(last_long, curr_long, on=[geo_col, var_col, "SEASON"], how="inner")
+    
+    # 5. Calculate Multiplier (handle zeros properly)
+    merged["LAST_VAL"] = pd.to_numeric(merged["LAST_VAL"], errors="coerce").fillna(0)
+    merged["CURR_VAL"] = pd.to_numeric(merged["CURR_VAL"], errors="coerce").fillna(0)
+    
+    # If either value is 0 (something/0, 0/something, or 0/0), set multiplier to 1.0
+    merged["MULTIPLIER"] = np.where(
+        (merged["CURR_VAL"] == 0) | (merged["LAST_VAL"] == 0), 
+        1.0, 
+        merged["LAST_VAL"] / merged["CURR_VAL"]
+    )
+    
+    # Format a clean dataframe for downloading
+    factors_df = merged[[geo_col, "SEASON", var_col, "LAST_VAL", "CURR_VAL", "MULTIPLIER"]].copy()
+    factors_df.rename(columns={geo_col: "GEOGRAPHY", var_col: "VARIABLE"}, inplace=True)
+    
+    # 6. Convert to the dictionary format expected by the app
+    pmf_dict = {}
+    for _, row in factors_df.iterrows():
+        geo = str(row["GEOGRAPHY"]).strip().upper()
+        season = str(row["SEASON"]).strip().upper()
+        var = str(row["VARIABLE"]).strip().upper() 
+        pmf_dict[(geo, season, var)] = row["MULTIPLIER"]
+        
+    return pmf_dict, factors_df
 
 def normalize_geo(name: str):
     return str(name).strip().upper().replace(".", "").replace("_", "").replace(" ", "")
@@ -238,11 +240,9 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
     multiplied_records, skipped_records = [], []
     updated_sheets = {}
     
-    # 1. Identify the Override sheet (assumes the sheet name contains "override")
     override_sheet_name = next((s for s in granular_sheets.keys() if "override" in s.lower()), None)
     overridden_combinations = set()
 
-    # Helper function to prevent code duplication between Override and Main tabs
     def process_row(df, idx, sheet_name_for_log, geo_for_lookup, var_col, contrib_col, min_col, max_col, is_override=False):
         raw_var = df.at[idx, var_col]
         raw_season = df.at[idx, contrib_col]
@@ -254,11 +254,9 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
         season = str(raw_season).strip().upper() if not pd.isna(raw_season) else ""
         geo_norm = normalize_geo(geo_for_lookup)
 
-        # If in override tab, log this specific (Geo, Var) combo so we skip it later in main sheets
         if is_override:
             overridden_combinations.add((geo_norm, var))
 
-        # Check if it was overridden (only applies when processing main sheets)
         if not is_override and (geo_norm, var) in overridden_combinations:
             skipped_records.append([sheet_name_for_log, var, season, "SKIPPED_DUE_TO_OVERRIDE", None, None, None, None])
             return
@@ -311,12 +309,10 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
         flag = "RED FLAG" if mult_val > warning_limit else ""
         multiplied_records.append([sheet_name_for_log, var, season, used_geo, multiplier, old_min, old_max, new_min, new_max, flag])
 
-    # 2. Process Override Sheet First
     if override_sheet_name:
         df_over = granular_sheets[override_sheet_name].copy()
         cols_upper = [str(c).upper() for c in df_over.columns]
         
-        # Override tab needs to have the Geography column to function
         if {"GEOGRAPHY", "VARIABLE", "CONTRIBUTION", "MIN", "MAX"}.issubset(cols_upper):
             geo_col = df_over.columns[cols_upper.index("GEOGRAPHY")]
             var_col = df_over.columns[cols_upper.index("VARIABLE")]
@@ -338,15 +334,13 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
                 if pd.isna(raw_geo) or str(raw_geo).strip() == "":
                     continue
                 
-                # Use raw_geo as the lookup geography, passing is_override=True
                 process_row(df_over, idx, override_sheet_name, raw_geo, var_col, contrib_col, min_col, max_col, is_override=True)
                 
         updated_sheets[override_sheet_name] = df_over
 
-    # 3. Process Main Sheets
     for sheet_name, df_full in granular_sheets.items():
         if sheet_name == override_sheet_name:
-            continue # Already processed
+            continue 
             
         df = df_full.copy()
         cols_upper = [str(c).upper() for c in df.columns]
@@ -370,7 +364,6 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
             )
 
         for idx in df.index:
-            # Use the sheet_name as the lookup geography
             process_row(df, idx, sheet_name, sheet_name, var_col, contrib_col, min_col, max_col, is_override=False)
 
         updated_sheets[sheet_name] = df
@@ -388,9 +381,16 @@ def apply_multipliers(granular_sheets, map_df, pmf_dict, selected_vars, toleranc
     )
     
     return updated_sheets, multiplied_df, skipped_df
+
 # =========================
 # OUTPUT HELPERS
 # =========================
+def create_factors_excel(factors_df):
+    output_buffer = io.BytesIO()
+    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+        factors_df.to_excel(writer, sheet_name="Factors", index=False)
+    return output_buffer.getvalue()
+
 def create_output_excel(granular_sheets, updated_sheets):
     output_buffer = io.BytesIO()
 
@@ -463,10 +463,9 @@ def create_log_excel(multiplied_df, skipped_df):
         
         # --- APPLY RED FLAG FORMATTING ---
         ws = writer.sheets["Multiplied"]
-        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid") # Light red background
-        red_font = Font(color="9C0006") # Dark red text
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        red_font = Font(color="9C0006")
         
-        # Find index of the FLAG column
         flag_col_idx = None
         for col_idx, cell in enumerate(ws[1], 1):
             if cell.value == "FLAG":
@@ -491,17 +490,20 @@ defaults = {
     "step2_complete": False,
     "step3_complete": False,
     "main_spec": None,
-    "pmf": None,
+    "last_weekly": None,
+    "curr_weekly": None,
     "map_df": None,
     "granular_sheets": None,
     "selected_types": None,
     "selected_vars": None,
     "pmf_dict": None,
+    "factors_df": None,
     "updated_sheets": None,
     "multiplied_df": None,
     "skipped_df": None,
     "output_file_bytes": None,
     "log_file_bytes": None,
+    "factors_file_bytes": None,
     "log_summary_df": None,
     "tolerance_map": {}, 
     "var_to_type": {},
@@ -514,7 +516,7 @@ for key, value in defaults.items():
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "Step 1: Upload Files", 
-    "Step 2: Select Types & Tolerance", 
+    "Step 2: Config & Mapping", 
     "Step 3: Run Process", 
     "Step 4: Download Results"
 ])
@@ -524,23 +526,39 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # =========================
 with tab1:
     st.header("Step 1: Upload Files")
-    st.info("Please upload the three required Excel files. Processing will begin automatically.")
+    st.info("Please upload the Granular, Main Spec, and the Combined Weekly file.")
 
     gran_file = st.file_uploader("1. Select Granular Spec (Excel)", type=['xlsx'])
-    pmf_file = st.file_uploader("2. Select PMF File (Excel)", type=['xlsx'])
-    main_file = st.file_uploader("3. Select Main Spec (Excel)", type=['xlsx'])
+    main_file = st.file_uploader("2. Select Main Spec (Excel)", type=['xlsx'])
+    weekly_file = st.file_uploader("3. Select Combined Weekly File (Excel)", type=['xlsx'])
 
-    if gran_file and pmf_file and main_file:
+    if gran_file and main_file and weekly_file:
         with st.spinner("Loading files..."):
             main_spec_df = load_main_spec(main_file)
-            pmf_df = load_pmf(pmf_file)
             map_df, granular_sheets_dict = load_granular(gran_file)
+            
+            # Read Combined Weekly file
+            last_weekly_df = None
+            curr_weekly_df = None
+            try:
+                weekly_xl = pd.ExcelFile(weekly_file)
+                last_sheet = next((s for s in weekly_xl.sheet_names if "last" in s.lower()), None)
+                curr_sheet = next((s for s in weekly_xl.sheet_names if "current" in s.lower()), None)
+                
+                if not last_sheet or not curr_sheet:
+                    st.error("❌ The Combined Weekly File must contain one sheet with 'last' and one with 'current' in the name.")
+                else:
+                    last_weekly_df = pd.read_excel(weekly_file, sheet_name=last_sheet)
+                    curr_weekly_df = pd.read_excel(weekly_file, sheet_name=curr_sheet)
+            except Exception as e:
+                st.error(f"Error loading Combined Weekly file: {e}")
 
-        if main_spec_df is not None and pmf_df is not None and map_df is not None:
+        if main_spec_df is not None and map_df is not None and last_weekly_df is not None and curr_weekly_df is not None:
             st.session_state["main_spec"] = main_spec_df
-            st.session_state["pmf"] = pmf_df
             st.session_state["map_df"] = map_df
             st.session_state["granular_sheets"] = granular_sheets_dict
+            st.session_state["last_weekly"] = last_weekly_df
+            st.session_state["curr_weekly"] = curr_weekly_df
             st.session_state["step1_complete"] = True
             
             st.session_state["var_to_type"] = dict(zip(main_spec_df["VARIABLE"], main_spec_df["TYPE"]))
@@ -549,10 +567,14 @@ with tab1:
             st.subheader("File Previews (First 5 Rows)")
             st.write("**Main Spec (Processed)**")
             st.dataframe(main_spec_df.head())
-            st.write("**PMF (Processed)**")
-            st.dataframe(pmf_df.head())
-            st.write("**Granular MAP (Processed)**")
-            st.dataframe(map_df.head())
+            
+            col_prev1, col_prev2 = st.columns(2)
+            with col_prev1:
+                st.write("**Last Weekly Data**")
+                st.dataframe(last_weekly_df.head())
+            with col_prev2:
+                st.write("**Current Weekly Data**")
+                st.dataframe(curr_weekly_df.head())
         else:
             st.error("One or more files failed to load. Please check errors above.")
             st.session_state["step1_complete"] = False
@@ -565,8 +587,29 @@ with tab2:
     if not st.session_state["step1_complete"]:
         st.warning("Please upload all files in Step 1 first.")
     else:
+        # --- WEEKLY FILE CONFIGURATION ---
+        st.subheader("1. Weekly File Mapping")
+        last_weekly_df = st.session_state["last_weekly"]
+        cols_list = list(last_weekly_df.columns)
+        
+        available_models = last_weekly_df['ModelKey'].dropna().unique().tolist()
+        selected_model = st.selectbox("Select ModelKey:", available_models)
+        st.session_state["selected_model"] = selected_model
+        
+        default_geo_idx = cols_list.index("DataBase") if "DataBase" in cols_list else 0
+        default_var_idx = cols_list.index("3.3") if "3.3" in cols_list else 0
+
+        col1, col2 = st.columns(2)
+        geo_col = col1.selectbox("Which column contains the Geography?", cols_list, index=default_geo_idx)
+        var_col = col2.selectbox("Which column contains the Variable names?", cols_list, index=default_var_idx)
+        
+        st.session_state["weekly_geo_col"] = geo_col
+        st.session_state["weekly_var_col"] = var_col
+        
+        st.divider()
+        
         # --- VARIABLE TYPES ---
-        st.subheader("1. Variable Types")
+        st.subheader("2. Variable Types")
         
         choice_map = {
             "Base": ["Base"],
@@ -591,7 +634,7 @@ with tab2:
         st.divider()
 
         # --- DYNAMIC TOLERANCE SETTINGS ---
-        st.subheader("2. Tolerance Level")
+        st.subheader("3. Tolerance Level")
         st.info("Set the skip tolerance range for **each** selected variable type.")
         
         tolerance_map_temp = {}
@@ -612,7 +655,7 @@ with tab2:
         st.divider()
         
         # --- MULTIPLIER LIMITS ---
-        st.subheader("3. Multiplier Limits")
+        st.subheader("4. Multiplier Limits")
         st.info("Set the hard limit (skips row) and warning threshold (flags red in log).")
         c3, c4 = st.columns(2)
         st.session_state["warning_limit"] = c3.number_input("Warning Threshold (> flags red)", value=50.0, step=1.0)
@@ -634,7 +677,7 @@ with tab3:
     if not st.session_state["step2_complete"]:
         st.warning("Please complete Steps 1 and 2 first.")
     else:
-        st.info("This step will prepare the PMF multipliers and apply them to all sheets.")
+        st.info("This step will generate the multipliers dynamically and apply them to all sheets.")
         
         if st.button("🚀 Run Multiplier Process", type="primary", use_container_width=True):
             
@@ -655,11 +698,18 @@ with tab3:
             time.sleep(1.2)
             
             try:
-                # Step 4: Prepare PMF
-                pmf_dict = prepare_pmf_multipliers(st.session_state["pmf"])
+                # Step 4: Generate Dynamic Factors
+                pmf_dict, factors_df = generate_dynamic_pmf(
+                    st.session_state["last_weekly"],
+                    st.session_state["curr_weekly"],
+                    st.session_state["selected_model"],
+                    st.session_state["weekly_var_col"],
+                    st.session_state["weekly_geo_col"]
+                )
                 st.session_state["pmf_dict"] = pmf_dict
+                st.session_state["factors_df"] = factors_df
                 
-                # Step 5: Apply Multipliers (With DYNAMIC Tolerance & Limits)
+                # Step 5: Apply Multipliers
                 updated_sheets, multiplied_df, skipped_df = apply_multipliers(
                     st.session_state["granular_sheets"],
                     st.session_state["map_df"],
@@ -677,7 +727,7 @@ with tab3:
                 st.session_state["step3_complete"] = True
                 
                 loader_placeholder.empty() # Remove Animation
-                st.success("✅ Multipliers applied successfully!")
+                st.success("✅ Multipliers calculated and applied successfully!")
                 st.metric("Records Multiplied", len(multiplied_df))
                 st.metric("Records Skipped", len(skipped_df))
                 
@@ -696,19 +746,22 @@ with tab4:
     else:
         st.success("🎉 Process completed! Your files are ready for download.")
         
+        # Format strings for export names
+        today_str = date.today().isoformat()
+        types_str = '_'.join(st.session_state['selected_types'])
+        granular_outfile_name = f"Granular_Updated_{types_str}_{today_str}.xlsx"
+        log_outfile_name = f"Granular_Log_{types_str}_{today_str}.xlsx"
+        factors_outfile_name = f"Calculated_Factors_{types_str}_{today_str}.xlsx"
+
+        # Export 1: Granular Updated
         if st.session_state["output_file_bytes"] is None:
-            with st.spinner("Generating Excel file..."):
+            with st.spinner("Generating Updated Granular Excel file..."):
                 output_bytes = create_output_excel(
                     st.session_state["granular_sheets"],
                     st.session_state["updated_sheets"]
                 )
             st.session_state["output_file_bytes"] = output_bytes
         
-        today_str = date.today().isoformat()
-        types_str = '_'.join(st.session_state['selected_types'])
-        granular_outfile_name = f"Granular_Updated_{types_str}_{today_str}.xlsx"
-        log_outfile_name = f"Granular_Log_{types_str}_{today_str}.xlsx"
-
         st.download_button(
             label="💾 Download Updated Granular File",
             data=st.session_state["output_file_bytes"],
@@ -719,8 +772,24 @@ with tab4:
         
         st.markdown("---")
         
-        generate_log = st.checkbox("Generate detailed log file?", value=True)
+        col_down1, col_down2 = st.columns(2)
         
+        # Export 2: Calculated Factors Sheet
+        generate_factors = col_down1.checkbox("Download Calculated Factors Sheet?", value=True)
+        if generate_factors:
+            if st.session_state["factors_file_bytes"] is None:
+                st.session_state["factors_file_bytes"] = create_factors_excel(st.session_state["factors_df"])
+            
+            col_down1.download_button(
+                label="📊 Download Factors Sheet",
+                data=st.session_state["factors_file_bytes"],
+                file_name=factors_outfile_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        
+        # Export 3: Processing Log
+        generate_log = col_down2.checkbox("Generate detailed log file?", value=True)
         if generate_log:
             if st.session_state["log_file_bytes"] is None:
                 log_bytes, summary_df = create_log_excel(
@@ -731,7 +800,7 @@ with tab4:
                 st.session_state["log_summary_df"] = summary_df
 
             if st.session_state["log_file_bytes"]:
-                st.download_button(
+                col_down2.download_button(
                     label="📋 Download Log File",
                     data=st.session_state["log_file_bytes"],
                     file_name=log_outfile_name,
@@ -739,14 +808,20 @@ with tab4:
                     use_container_width=True
                 )
                 
-                st.subheader("Log Summary")
-                st.dataframe(st.session_state["log_summary_df"])
+        st.markdown("---")
+        
+        if st.session_state["log_summary_df"] is not None:
+            st.subheader("Log Summary")
+            st.dataframe(st.session_state["log_summary_df"])
 
         with st.expander("View Multiplied Records Details"):
             st.dataframe(st.session_state["multiplied_df"])
         
         with st.expander("View Skipped Records Details"):
             st.dataframe(st.session_state["skipped_df"])
+            
+        with st.expander("View Generated Factors"):
+            st.dataframe(st.session_state["factors_df"])
 
     st.markdown("---")
     if st.button("🔄 Start Over", type="secondary", use_container_width=True):
